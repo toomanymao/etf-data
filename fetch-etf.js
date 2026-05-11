@@ -55,6 +55,10 @@ async function main() {
     // 1. Fetch aggregate totals (free tier — last 300 days)
     const agg = await post('/openapi/v2/etf/historicalInflowChart', { type: 'us-btc-spot' });
 
+    console.log('API response code:', agg.code);
+    console.log('API message:', agg.msg);
+    console.log('Data rows received:', agg.data?.list?.length ?? 0);
+
     if (agg.code !== 0) {
         throw new Error(`SoSoValue aggregate error: ${agg.msg}`);
     }
