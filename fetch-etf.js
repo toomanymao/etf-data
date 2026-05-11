@@ -30,6 +30,7 @@ function post(path, body) {
                 'Content-Type':    'application/json',
                 'Content-Length':  Buffer.byteLength(data),
             },
+            rejectUnauthorized: false, // fix for GitHub Actions SSL cert issue
         };
 
         const req = https.request(options, res => {
