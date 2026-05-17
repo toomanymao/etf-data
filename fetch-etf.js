@@ -4,6 +4,21 @@ const fs = require('fs');
 const SOSO_KEY = process.env.SOSO_KEY;
 const ETFS = ['IBIT','FBTC','GBTC','ARKB','BITB','BTCO','HODL','BRRR','EZBC','BTCW','BTC','MSBT'];
 
+const ETF_TYPES = [
+    ['IBIT','Etf_NASDAQ_IBIT'],
+    ['FBTC','Etf_NYSE_FBTC'],
+    ['GBTC','Etf_NYSE_GBTC'],
+    ['ARKB','Etf_CBOE_ARKB'],
+    ['BITB','Etf_NYSE_BITB'],
+    ['BTCO','Etf_NYSE_BTCO'],
+    ['HODL','Etf_CBOE_HODL'],
+    ['BRRR','Etf_NASDAQ_BRRR'],
+    ['EZBC','Etf_CBOE_EZBC'],
+    ['BTCW','Etf_NYSE_BTCW'],
+    ['BTC','Etf_NYSE_BTC'],
+    ['MSBT','Etf_NYSE_MSBT'],
+];
+
 const US_HOLIDAYS = new Set([
     '2024-01-01','2024-01-15','2024-02-19','2024-03-29','2024-05-27','2024-06-19','2024-07-04','2024-09-02','2024-11-28','2024-12-25',
     '2025-01-01','2025-01-20','2025-02-17','2025-04-18','2025-05-26','2025-06-19','2025-07-04','2025-09-01','2025-11-27','2025-12-25',
@@ -46,48 +61,84 @@ function postRequest(body) {
 }
 
 async function main() {
-    console.log('Starting... API key:', SOSO_KEY ? SOSO_KEY.slice(0,8)+'...' : 'MISSING');
+    console.log('Starting... key:', SOSO_KEY ? SOSO_KEY.slice(0,8)+'...' : 'MISSING');
     if (!SOSO_KEY) { console.error('No API key'); process.exit(1); }
 
-    const res = await postRequest({ type: 'us-btc-spot' });
-    console.log('Response code:', res.code);
+    // Step 1: Fetch aggregate totals
+    console.log('\n--- Fetching aggregate totals ---');
+    const aggRes = await postRequest({ type: 'us-btc-spot' });
+    console.log('Code:', aggRes.code, 'rows:', aggRes.data?.length ?? aggRes.data?.list?.length ?? 0);
 
-    // Handle both array formats: res.data[] or res.data.list[]
-    let list = [];
-    if (Array.isArray(res.data)) list = res.data;
-    else if (Array.isArray(res.data?.list)) list = res.data.list;
-
+    let list = Array.isArray(aggRes.data) ? aggRes.data : (aggRes.data?.list || []);
     console.log('List length:', list.length);
-    if (list.length > 0) console.log('Sample:', JSON.stringify(list[0]).slice(0,120));
 
-    const freshRows = list
-        .map(item => {
-            const date = item.date;
-            if (!date || !isTradingDay(date)) return null;
-            const totalM = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
-            if (totalM === 0) return null;
-            const row = { date };
-            ETFS.forEach(e => { row[e] = null; });
-            row.total = totalM;
-            return row;
-        })
-        .filter(Boolean)
-        .sort((a, b) => b.date.localeCompare(a.date));
+    // Build a map of date -> total
+    const totalsMap = {};
+    list.forEach(item => {
+        if (item.date && isTradingDay(item.date)) {
+            totalsMap[item.date] = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
+        }
+    });
+    console.log('Trading day totals:', Object.keys(totalsMap).length, '| Latest:', Object.keys(totalsMap).sort().reverse()[0]);
 
-    console.log('Valid rows:', freshRows.length);
+    // Step 2: Fetch per-ETF breakdown
+    console.log('\n--- Fetching per-ETF data ---');
+    const perEtf = {}; // { date: { IBIT: x, FBTC: y, ... } }
 
-    // Merge with existing
+    for (const [ticker, type] of ETF_TYPES) {
+        try {
+            const res = await postRequest({ type });
+            const etfList = Array.isArray(res.data) ? res.data : (res.data?.list || []);
+            let count = 0;
+            etfList.forEach(item => {
+                if (!item.date || !isTradingDay(item.date)) return;
+                if (!perEtf[item.date]) perEtf[item.date] = {};
+                perEtf[item.date][ticker] = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
+                count++;
+            });
+            console.log(ticker + ':', count, 'days | code:', res.code);
+        } catch(e) {
+            console.log(ticker + ': failed -', e.message);
+        }
+    }
+
+    // Step 3: Build final rows combining totals + per-ETF
+    const allDates = new Set([...Object.keys(totalsMap), ...Object.keys(perEtf)]);
+    const freshRows = [];
+
+    allDates.forEach(date => {
+        if (!isTradingDay(date)) return;
+        const total = totalsMap[date];
+        if (total === undefined || total === 0) return;
+
+        const row = { date };
+        ETFS.forEach(e => {
+            row[e] = perEtf[date]?.[e] ?? null;
+        });
+        row.total = total;
+        freshRows.push(row);
+    });
+
+    freshRows.sort((a, b) => b.date.localeCompare(a.date));
+    console.log('\nFresh rows built:', freshRows.length, '| Latest:', freshRows[0]?.date);
+
+    // Check per-ETF coverage
+    const hasPerEtf = freshRows.slice(0, 5).some(r => ETFS.some(e => r[e] !== null));
+    console.log('Per-ETF data available:', hasPerEtf);
+
+    // Step 4: Merge with existing file
     let existingRows = [];
     if (fs.existsSync('etf-flows.json')) {
         try {
             const existing = JSON.parse(fs.readFileSync('etf-flows.json', 'utf8'));
             existingRows = (existing.rows || []).filter(r => r.total !== 0 && isTradingDay(r.date));
+            console.log('Existing rows:', existingRows.length);
         } catch(e) {}
     }
 
     const merged = {};
     existingRows.forEach(r => { merged[r.date] = r; });
-    freshRows.forEach(r => { merged[r.date] = r; });
+    freshRows.forEach(r => { merged[r.date] = r; }); // fresh wins
 
     const finalRows = Object.values(merged)
         .filter(r => r.total !== 0 && isTradingDay(r.date))
@@ -96,6 +147,7 @@ async function main() {
     fs.writeFileSync('etf-flows.json', JSON.stringify({
         generated: new Date().toISOString(),
         source: 'SoSoValue API via GitHub Actions',
+        hasPerEtf,
         etfs: ETFS,
         count: finalRows.length,
         latest: finalRows[0]?.date,
@@ -103,10 +155,10 @@ async function main() {
         rows: finalRows,
     }, null, 2));
 
-    console.log('Done! Written', finalRows.length, 'rows. Latest:', finalRows[0]?.date);
+    console.log('\nDone! Written', finalRows.length, 'rows | Latest:', finalRows[0]?.date);
 }
 
 main().catch(err => {
-    console.error('Error:', err.message);
+    console.error('Fatal:', err.message);
     process.exit(0);
 });
