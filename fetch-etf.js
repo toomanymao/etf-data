@@ -1,7 +1,7 @@
 /**
- * fetch-etf.js — Runs inside GitHub Actions
- * Fetches SoSoValue API and writes etf-flows.json
- * Falls back to BASELINE data if API unavailable
+ * fetch-etf.js — GitHub Actions daily ETF data fetcher
+ * Tries multiple sources in order until one works.
+ * Always writes data — falls back to extending existing data with today's date.
  */
 
 const https = require('https');
@@ -10,165 +10,233 @@ const fs    = require('fs');
 const SOSO_KEY = process.env.SOSO_KEY;
 const ETFS = ['IBIT','FBTC','GBTC','ARKB','BITB','BTCO','HODL','BRRR','EZBC','BTCW','BTC','MSBT'];
 
-if (!SOSO_KEY) {
-    console.error('ERROR: SOSO_KEY not set.');
-    process.exit(1);
-}
-console.log('API key:', SOSO_KEY.slice(0,8) + '...');
+const US_HOLIDAYS = new Set([
+    '2024-01-01','2024-01-15','2024-02-19','2024-03-29','2024-05-27','2024-06-19','2024-07-04','2024-09-02','2024-11-28','2024-12-25',
+    '2025-01-01','2025-01-20','2025-02-17','2025-04-18','2025-05-26','2025-06-19','2025-07-04','2025-09-01','2025-11-27','2025-12-25',
+    '2026-01-01','2026-01-19','2026-02-16','2026-04-03','2026-05-25','2026-06-19','2026-07-03','2026-09-07','2026-11-26','2026-12-25',
+    '2027-01-01','2027-01-18','2027-02-15','2027-03-26','2027-05-31','2027-06-18','2027-07-05','2027-09-06','2027-11-25','2027-12-24',
+]);
 
-function post(path, body) {
+function isTradingDay(date) {
+    const d = new Date(date + 'T12:00:00Z');
+    return d.getDay() !== 0 && d.getDay() !== 6 && !US_HOLIDAYS.has(date);
+}
+
+function todayISO() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function get(url) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, { rejectUnauthorized: false }, res => {
+            let raw = '';
+            res.on('data', chunk => raw += chunk);
+            res.on('end', () => {
+                try { resolve(JSON.parse(raw)); }
+                catch { reject(new Error('Bad JSON from ' + url.slice(0,60))); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
+    });
+}
+
+function post(hostname, path, body, headers = {}) {
     return new Promise((resolve, reject) => {
         const data = JSON.stringify(body);
         const options = {
-            hostname: 'api.sosovalue.xyz',
-            port: 443, path, method: 'POST',
-            headers: {
-                'x-soso-api-key': SOSO_KEY,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(data),
-            },
+            hostname, port: 443, path, method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), ...headers },
             rejectUnauthorized: false,
         };
         const req = https.request(options, res => {
             let raw = '';
-            console.log('  HTTP status:', res.statusCode);
             res.on('data', chunk => raw += chunk);
             res.on('end', () => {
-                console.log('  Response:', raw.slice(0, 300));
                 try { resolve(JSON.parse(raw)); }
-                catch { reject(new Error('Bad JSON: ' + raw.slice(0,100))); }
+                catch { reject(new Error('Bad JSON')); }
             });
         });
         req.on('error', reject);
-        req.setTimeout(30000, () => { req.destroy(); reject(new Error('Timeout')); });
+        req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
         req.write(data);
         req.end();
     });
 }
 
-const BASELINE = [
-    {date:'2026-05-09',IBIT:-45.2,FBTC:-38.1,GBTC:-12.4,ARKB:-8.4,BITB:-3.2,BTCO:0,HODL:0,BRRR:0,EZBC:-1.8,BTCW:0,BTC:3.2,MSBT:5.9,total:-99.8},
-    {date:'2026-05-08',IBIT:-27.2,FBTC:-97.6,GBTC:0,ARKB:-26.6,BITB:-2.1,BTCO:0,HODL:0,BRRR:0,EZBC:-3.6,BTCW:0,BTC:3.2,MSBT:5.7,total:-148.2},
-    {date:'2026-05-07',IBIT:-98.0,FBTC:-129.0,GBTC:-18.4,ARKB:-22.1,BITB:-8.6,BTCO:0,HODL:0,BRRR:0,EZBC:-12.4,BTCW:0,BTC:5.7,MSBT:7.3,total:-275.5},
-    {date:'2026-05-06',IBIT:134.6,FBTC:-42.3,GBTC:-18.2,ARKB:0,BITB:-14.4,BTCO:0,HODL:0,BRRR:0,EZBC:-18.6,BTCW:0,BTC:2.4,MSBT:2.8,total:46.3},
-    {date:'2026-05-05',IBIT:198.4,FBTC:86.2,GBTC:-8.4,ARKB:32.1,BITB:14.8,BTCO:0,HODL:4.2,BRRR:0,EZBC:6.4,BTCW:0,BTC:8.6,MSBT:4.2,total:346.5},
-    {date:'2026-05-04',IBIT:335.5,FBTC:184.6,GBTC:0,ARKB:0,BITB:12.2,BTCO:0,HODL:0,BRRR:0,EZBC:0,BTCW:0,BTC:0,MSBT:0,total:532.3},
-    {date:'2026-05-01',IBIT:452.6,FBTC:213.8,GBTC:-24.9,ARKB:38.2,BITB:22.4,BTCO:0,HODL:6.5,BRRR:0,EZBC:11.2,BTCW:0,BTC:0,MSBT:7.2,total:727.0},
-    {date:'2026-04-30',IBIT:-148.4,FBTC:-55.8,GBTC:-18,ARKB:-20,BITB:-9.0,BTCO:-3.8,HODL:-1.6,BRRR:-2.4,EZBC:-0.9,BTCW:-0.6,BTC:-4.7,MSBT:0,total:-265.2},
-    {date:'2026-04-29',IBIT:-89.7,FBTC:-34,GBTC:-7,ARKB:-12,BITB:-5.5,BTCO:-2.3,HODL:-1.0,BRRR:-1.5,EZBC:-0.5,BTCW:-0.4,BTC:-2.8,MSBT:0,total:-156.7},
-    {date:'2026-04-28',IBIT:-263,FBTC:-99,GBTC:-21,ARKB:-36,BITB:-16.2,BTCO:-6.8,HODL:-2.9,BRRR:-4.4,EZBC:-1.6,BTCW:-1.1,BTC:-8.3,MSBT:0,total:-460.3},
-    {date:'2026-04-25',IBIT:287,FBTC:108,GBTC:-12,ARKB:39,BITB:17.7,BTCO:7.4,HODL:3.2,BRRR:4.9,EZBC:1.7,BTCW:1.2,BTC:9.0,MSBT:0,total:467.1},
-    {date:'2026-04-24',IBIT:312,FBTC:117,GBTC:-8,ARKB:43,BITB:19.2,BTCO:8.1,HODL:3.5,BRRR:5.3,EZBC:1.9,BTCW:1.3,BTC:9.8,MSBT:0,total:513.1},
-    {date:'2026-04-22',IBIT:398,FBTC:149,GBTC:9,ARKB:54,BITB:24.4,BTCO:10.3,HODL:4.5,BRRR:6.7,EZBC:2.4,BTCW:1.7,BTC:12.5,MSBT:0,total:672.5},
-    {date:'2026-04-21',IBIT:471,FBTC:177,GBTC:5,ARKB:64,BITB:28.9,BTCO:12.2,HODL:5.3,BRRR:7.9,EZBC:2.8,BTCW:2.0,BTC:14.8,MSBT:0,total:790.9},
-    {date:'2026-04-17',IBIT:289,FBTC:108,GBTC:12,ARKB:40,BITB:17.7,BTCO:7.4,HODL:3.2,BRRR:4.8,EZBC:1.7,BTCW:1.2,BTC:9.1,MSBT:0,total:494.1},
-    {date:'2026-04-07',IBIT:-342,FBTC:-128,GBTC:-47,ARKB:-47,BITB:-21.0,BTCO:-8.8,HODL:-3.8,BRRR:-5.7,EZBC:-2.0,BTCW:-1.4,BTC:-10.7,MSBT:0,total:-617.4},
-    {date:'2026-04-01',IBIT:243,FBTC:91,GBTC:-7,ARKB:33,BITB:14.9,BTCO:6.3,HODL:2.7,BRRR:4.1,EZBC:1.5,BTCW:1.0,BTC:7.6,MSBT:0,total:398.1},
-    {date:'2026-03-10',IBIT:397,FBTC:149,GBTC:8,ARKB:54,BITB:24.3,BTCO:10.2,HODL:4.5,BRRR:6.7,EZBC:2.4,BTCW:1.7,BTC:12.5,MSBT:0,total:670.3},
-    {date:'2026-02-10',IBIT:326,FBTC:122,GBTC:-8,ARKB:45,BITB:20.0,BTCO:8.4,HODL:3.7,BRRR:5.5,EZBC:2.0,BTCW:1.4,BTC:10.2,MSBT:0,total:536.2},
-    {date:'2026-01-13',IBIT:458,FBTC:172,GBTC:12,ARKB:63,BITB:28.1,BTCO:11.8,HODL:5.2,BRRR:7.7,EZBC:2.8,BTCW:2.0,BTC:14.4,MSBT:0,total:777.0},
-    {date:'2025-12-15',IBIT:693,FBTC:260,GBTC:44,ARKB:95,BITB:42.5,BTCO:17.9,HODL:7.8,BRRR:11.6,EZBC:4.1,BTCW:2.9,BTC:21.8,MSBT:0,total:1200.6},
-    {date:'2025-11-03',IBIT:841,FBTC:316,GBTC:62,ARKB:115,BITB:51.5,BTCO:21.7,HODL:9.4,BRRR:14.1,EZBC:5.0,BTCW:3.6,BTC:26.4,MSBT:0,total:1465.7},
-    {date:'2025-04-07',IBIT:-342,FBTC:-129,GBTC:-47,ARKB:-47,BITB:-21.0,BTCO:-8.8,HODL:-3.8,BRRR:-5.7,EZBC:-2.0,BTCW:-1.4,BTC:-14.2,MSBT:0,total:-621.9},
-    {date:'2025-01-13',IBIT:773,FBTC:290,GBTC:29,ARKB:105,BITB:47.0,BTCO:19.8,HODL:8.6,BRRR:12.8,EZBC:4.6,BTCW:3.3,BTC:24.0,MSBT:0,total:1317.1},
-    {date:'2024-12-16',IBIT:1589,FBTC:473,GBTC:63,ARKB:187,BITB:83.0,BTCO:36.0,HODL:15.5,BRRR:23.0,EZBC:8.3,BTCW:5.9,BTC:45.0,MSBT:null,total:2528.7},
-    {date:'2024-11-07',IBIT:1113,FBTC:390,GBTC:17,ARKB:113,BITB:50.0,BTCO:21.0,HODL:9.0,BRRR:13.5,EZBC:4.9,BTCW:3.5,BTC:25.0,MSBT:null,total:1759.9},
-    {date:'2024-03-13',IBIT:1026,FBTC:344,GBTC:-212,ARKB:147,BITB:66.0,BTCO:28.0,HODL:12.0,BRRR:18.5,EZBC:6.6,BTCW:4.7,BTC:null,MSBT:null,total:1440.8},
-    {date:'2024-01-11',IBIT:111.7,FBTC:227.2,GBTC:-95.1,ARKB:0,BITB:0,BTCO:0,HODL:0,BRRR:0,EZBC:0,BTCW:0,BTC:null,MSBT:null,total:243.8},
-];
+// ── SOURCE 1: SoSoValue API ────────────────────────────────────────────────
+async function fetchSoSoValue() {
+    if (!SOSO_KEY) throw new Error('No API key');
+    console.log('Trying SoSoValue...');
+    const res = await post('api.sosovalue.xyz', '/openapi/v2/etf/historicalInflowChart',
+        { type: 'us-btc-spot' },
+        { 'x-soso-api-key': SOSO_KEY }
+    );
+    console.log('SoSoValue code:', res.code, 'rows:', res.data?.list?.length ?? 0);
+    if (res.code !== 0 || !res.data?.list?.length) throw new Error(res.msg || 'Empty response');
 
-function mergeAndWrite(apiRows, source) {
+    const list = res.data.list;
+
+    // Try per-ETF breakdown
+    const perEtf = {};
+    const ETF_TYPES = [
+        ['IBIT','Etf_NASDAQ_IBIT'],['FBTC','Etf_NYSE_FBTC'],['GBTC','Etf_NYSE_GBTC'],
+        ['ARKB','Etf_CBOE_ARKB'],['BITB','Etf_NYSE_BITB'],['BTCO','Etf_NYSE_BTCO'],
+        ['HODL','Etf_CBOE_HODL'],['BRRR','Etf_NASDAQ_BRRR'],['EZBC','Etf_CBOE_EZBC'],
+        ['BTCW','Etf_NYSE_BTCW'],['BTC','Etf_NYSE_BTC'],['MSBT','Etf_NYSE_MSBT'],
+    ];
+    await Promise.allSettled(ETF_TYPES.map(async ([ticker, type]) => {
+        try {
+            const r = await post('api.sosovalue.xyz', '/openapi/v2/etf/historicalInflowChart',
+                { type }, { 'x-soso-api-key': SOSO_KEY });
+            if (r.code !== 0) return;
+            (r.data?.list || []).forEach(item => {
+                if (!perEtf[item.date]) perEtf[item.date] = {};
+                perEtf[item.date][ticker] = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
+            });
+        } catch { /* skip */ }
+    }));
+
+    return list
+        .filter(item => isTradingDay(item.date))
+        .map(item => {
+            const row = { date: item.date };
+            ETFS.forEach(e => { row[e] = perEtf[item.date]?.[e] ?? null; });
+            row.total = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
+            return row;
+        })
+        .filter(r => r.total !== 0)
+        .sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// ── SOURCE 2: CoinGlass public endpoint (no key needed for basic data) ─────
+async function fetchCoinGlass() {
+    console.log('Trying CoinGlass public...');
+    const res = await get('https://open-api-v3.coinglass.com/api/etf/bitcoin/flow/history');
+    if (!res.data || !Array.isArray(res.data)) throw new Error('No data from CoinGlass');
+
+    const rows = [];
+    res.data.forEach(day => {
+        const date = new Date(day.t).toISOString().slice(0, 10);
+        if (!isTradingDay(date)) return;
+        const row = { date };
+        ETFS.forEach(e => { row[e] = null; });
+        row.total = parseFloat(((day.netFlow || 0) / 1e6).toFixed(2));
+        if (row.total !== 0) rows.push(row);
+    });
+
+    if (rows.length === 0) throw new Error('CoinGlass returned 0 valid rows');
+    console.log('CoinGlass rows:', rows.length);
+    return rows.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// ── SOURCE 3: Farside HTML scrape ─────────────────────────────────────────
+async function fetchFarside() {
+    console.log('Trying Farside...');
+    return new Promise((resolve, reject) => {
+        const req = https.get('https://farside.co.uk/btc/', {
+            rejectUnauthorized: false,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        }, res => {
+            let html = '';
+            res.on('data', chunk => html += chunk);
+            res.on('end', () => {
+                const rows = [];
+                const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
+                const cellRe = /<td[^>]*>([\s\S]*?)<\/td>/g;
+                let match;
+                while ((match = rowRe.exec(html)) !== null) {
+                    const cells = [];
+                    let cm;
+                    const rowHtml = match[1];
+                    while ((cm = cellRe.exec(rowHtml)) !== null) {
+                        cells.push(cm[1].replace(/<[^>]+>/g, '').trim());
+                    }
+                    if (cells.length >= 3 && /\d{2}\/\d{2}\/\d{4}/.test(cells[0])) {
+                        const parts = cells[0].split('/');
+                        const date = `${parts[2]}-${parts[1].padStart(2,'0')}-${parts[0].padStart(2,'0')}`;
+                        if (!isTradingDay(date)) continue;
+                        const total = parseFloat(cells[cells.length-1].replace(/[^-\d.]/g,''));
+                        if (!isNaN(total) && total !== 0) {
+                            const row = { date };
+                            ETFS.forEach(e => { row[e] = null; });
+                            row.total = total;
+                            rows.push(row);
+                        }
+                    }
+                }
+                if (rows.length === 0) reject(new Error('Farside: no rows parsed'));
+                else { console.log('Farside rows:', rows.length); resolve(rows.sort((a,b)=>b.date.localeCompare(a.date))); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
+    });
+}
+
+// ── MERGE & WRITE ──────────────────────────────────────────────────────────
+function mergeAndWrite(newRows, source) {
     const existing = fs.existsSync('etf-flows.json')
         ? JSON.parse(fs.readFileSync('etf-flows.json', 'utf8'))
         : { rows: [] };
 
     const merged = {};
-    BASELINE.forEach(r => { merged[r.date] = r; });
-    (existing.rows || []).filter(r => r.total !== 0).forEach(r => { merged[r.date] = r; });
-    apiRows.forEach(r => { merged[r.date] = r; }); // API rows win
+    (existing.rows || []).filter(r => r.total !== 0 && isTradingDay(r.date))
+        .forEach(r => { merged[r.date] = r; });
+    newRows.forEach(r => { merged[r.date] = r; }); // new data wins
 
     const finalRows = Object.values(merged)
-        .filter(r => r.total !== 0)
+        .filter(r => r.total !== 0 && isTradingDay(r.date))
         .sort((a, b) => b.date.localeCompare(a.date));
 
-    fs.writeFileSync('etf-flows.json', JSON.stringify({
+    const output = {
         generated: new Date().toISOString(),
         source, etfs: ETFS,
         count: finalRows.length,
         latest: finalRows[0]?.date,
         oldest: finalRows[finalRows.length-1]?.date,
         rows: finalRows,
-    }, null, 2));
+    };
 
-    console.log(`Written: ${finalRows.length} rows | Latest: ${finalRows[0]?.date}`);
+    fs.writeFileSync('etf-flows.json', JSON.stringify(output, null, 2));
+    console.log(`\n✅ Written: ${finalRows.length} rows | Latest: ${finalRows[0]?.date} | Source: ${source}`);
 }
 
+// ── MAIN ───────────────────────────────────────────────────────────────────
 async function main() {
-    console.log(`[${new Date().toISOString()}] Fetching ETF data...`);
+    console.log(`[${new Date().toISOString()}] Starting ETF fetch...`);
+    console.log('Today:', todayISO(), 'Is trading day:', isTradingDay(todayISO()));
 
-    try {
-        const agg = await post('/openapi/v2/etf/historicalInflowChart', { type: 'us-btc-spot' });
+    const sources = [
+        { name: 'SoSoValue', fn: fetchSoSoValue },
+        { name: 'CoinGlass',  fn: fetchCoinGlass },
+        { name: 'Farside',    fn: fetchFarside },
+    ];
 
-        if (agg.code !== 0 || !agg.data?.list?.length) {
-            console.warn('API returned no data — using BASELINE only');
-            mergeAndWrite([], 'Baseline data (SoSoValue returned empty)');
-            return;
+    for (const source of sources) {
+        try {
+            const rows = await source.fn();
+            if (rows && rows.length > 0) {
+                mergeAndWrite(rows, source.name);
+                return; // success — done
+            }
+        } catch (err) {
+            console.warn(`${source.name} failed:`, err.message);
         }
+    }
 
-        const list = agg.data.list;
-        console.log(`Got ${list.length} rows from API. Latest: ${list[0]?.date}`);
-
-        // Per-ETF breakdown
-        const ETF_TYPES = [
-            ['IBIT','Etf_NASDAQ_IBIT'],['FBTC','Etf_NYSE_FBTC'],['GBTC','Etf_NYSE_GBTC'],
-            ['ARKB','Etf_CBOE_ARKB'],['BITB','Etf_NYSE_BITB'],['BTCO','Etf_NYSE_BTCO'],
-            ['HODL','Etf_CBOE_HODL'],['BRRR','Etf_NASDAQ_BRRR'],['EZBC','Etf_CBOE_EZBC'],
-            ['BTCW','Etf_NYSE_BTCW'],['BTC','Etf_NYSE_BTC'],['MSBT','Etf_NYSE_MSBT'],
-        ];
-        const perEtf = {};
-        await Promise.allSettled(ETF_TYPES.map(async ([ticker, type]) => {
-            try {
-                const r = await post('/openapi/v2/etf/historicalInflowChart', { type });
-                if (r.code !== 0) return;
-                (r.data?.list || []).forEach(item => {
-                    if (!perEtf[item.date]) perEtf[item.date] = {};
-                    perEtf[item.date][ticker] = parseFloat((item.totalNetInflow/1e6).toFixed(2));
-                });
-                console.log(`  ${ticker}: ${r.data?.list?.length} days`);
-            } catch(e) { console.log(`  ${ticker}: ${e.message}`); }
-        }));
-
-        const US_HOLIDAYS = new Set([
-            '2024-01-01','2024-01-15','2024-02-19','2024-03-29','2024-05-27','2024-06-19','2024-07-04','2024-09-02','2024-11-28','2024-12-25',
-            '2025-01-01','2025-01-20','2025-02-17','2025-04-18','2025-05-26','2025-06-19','2025-07-04','2025-09-01','2025-11-27','2025-12-25',
-            '2026-01-01','2026-01-19','2026-02-16','2026-04-03','2026-05-25','2026-06-19','2026-07-03','2026-09-07','2026-11-26','2026-12-25',
-            '2027-01-01','2027-01-18','2027-02-15','2027-03-26','2027-05-31','2027-06-18','2027-07-05','2027-09-06','2027-11-25','2027-12-24',
-        ]);
-        const isTradingDay = date => {
-            const d = new Date(date + 'T12:00:00Z');
-            return d.getDay() !== 0 && d.getDay() !== 6 && !US_HOLIDAYS.has(date);
-        };
-
-        const apiRows = list
-            .filter(item => isTradingDay(item.date))
-            .map(item => {
-                const row = { date: item.date };
-                ETFS.forEach(e => { row[e] = perEtf[item.date]?.[e] ?? null; });
-                row.total = parseFloat((item.totalNetInflow/1e6).toFixed(2));
-                return row;
-            })
-            .filter(r => r.total !== 0);
-
-        mergeAndWrite(apiRows, 'SoSoValue API via GitHub Actions');
-
-    } catch(err) {
-        console.error('API failed:', err.message, '— using BASELINE');
-        mergeAndWrite([], 'Baseline data (API error)');
+    // All sources failed — keep existing data, just update timestamp
+    console.warn('All sources failed — keeping existing data');
+    if (fs.existsSync('etf-flows.json')) {
+        const existing = JSON.parse(fs.readFileSync('etf-flows.json', 'utf8'));
+        existing.generated = new Date().toISOString();
+        existing.source = existing.source + ' (cached)';
+        fs.writeFileSync('etf-flows.json', JSON.stringify(existing, null, 2));
+        console.log('Kept existing', existing.count, 'rows');
     }
 }
 
 main().catch(err => {
     console.error('FATAL:', err.message);
-    mergeAndWrite([], 'Baseline data (fatal error)');
-    process.exit(0);
+    process.exit(0); // exit 0 so git commit still runs
 });
