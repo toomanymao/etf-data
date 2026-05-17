@@ -1,6 +1,7 @@
 {
-  "generated": "2026-05-17T06:46:52.227Z",
+  "generated": "2026-05-17T06:55:08.838Z",
   "source": "SoSoValue API via GitHub Actions",
+  "hasPerEtf": false,
   "etfs": [
     "IBIT",
     "FBTC",
