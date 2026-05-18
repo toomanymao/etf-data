@@ -1,23 +1,8 @@
 const https = require('https');
-const fs = require('fs');
+const fs    = require('fs');
 
 const SOSO_KEY = process.env.SOSO_KEY;
 const ETFS = ['IBIT','FBTC','GBTC','ARKB','BITB','BTCO','HODL','BRRR','EZBC','BTCW','BTC','MSBT'];
-
-const ETF_TYPES = [
-    ['IBIT','Etf_NASDAQ_IBIT'],
-    ['FBTC','Etf_NYSE_FBTC'],
-    ['GBTC','Etf_NYSE_GBTC'],
-    ['ARKB','Etf_CBOE_ARKB'],
-    ['BITB','Etf_NYSE_BITB'],
-    ['BTCO','Etf_NYSE_BTCO'],
-    ['HODL','Etf_CBOE_HODL'],
-    ['BRRR','Etf_NASDAQ_BRRR'],
-    ['EZBC','Etf_CBOE_EZBC'],
-    ['BTCW','Etf_NYSE_BTCW'],
-    ['BTC','Etf_NYSE_BTC'],
-    ['MSBT','Etf_NYSE_MSBT'],
-];
 
 const US_HOLIDAYS = new Set([
     '2024-01-01','2024-01-15','2024-02-19','2024-03-29','2024-05-27','2024-06-19','2024-07-04','2024-09-02','2024-11-28','2024-12-25',
@@ -30,27 +15,34 @@ function isTradingDay(date) {
     return d.getDay() !== 0 && d.getDay() !== 6 && !US_HOLIDAYS.has(date);
 }
 
-function postRequest(body) {
+function httpGet(hostname, path, headers = {}) {
+    return new Promise((resolve, reject) => {
+        const options = { hostname, port: 443, path, method: 'GET',
+            headers: { 'User-Agent': 'Mozilla/5.0', ...headers },
+            rejectUnauthorized: false };
+        const req = https.request(options, res => {
+            let raw = '';
+            res.on('data', chunk => raw += chunk);
+            res.on('end', () => resolve(raw));
+        });
+        req.on('error', reject);
+        req.setTimeout(30000, () => { req.destroy(); reject(new Error('Timeout')); });
+        req.end();
+    });
+}
+
+function httpPost(hostname, path, body, headers = {}) {
     return new Promise((resolve, reject) => {
         const data = JSON.stringify(body);
-        const options = {
-            hostname: 'api.sosovalue.xyz',
-            port: 443,
-            path: '/openapi/v2/etf/historicalInflowChart',
-            method: 'POST',
-            headers: {
-                'x-soso-api-key': SOSO_KEY,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(data),
-            },
-            rejectUnauthorized: false,
-        };
+        const options = { hostname, port: 443, path, method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), ...headers },
+            rejectUnauthorized: false };
         const req = https.request(options, res => {
             let raw = '';
             res.on('data', chunk => raw += chunk);
             res.on('end', () => {
                 try { resolve(JSON.parse(raw)); }
-                catch(e) { reject(new Error('JSON parse failed')); }
+                catch { reject(new Error('Bad JSON')); }
             });
         });
         req.on('error', reject);
@@ -60,102 +52,148 @@ function postRequest(body) {
     });
 }
 
-async function main() {
-    console.log('Starting... key:', SOSO_KEY ? SOSO_KEY.slice(0,8)+'...' : 'MISSING');
-    if (!SOSO_KEY) { console.error('No API key'); process.exit(1); }
+// ── SCRAPE FARSIDE ─────────────────────────────────────────────────────────
+// Farside table columns: Date, IBIT, FBTC, GBTC, ARKB, BITB, BTCO, HODL, BRRR, EZBC, BTCW, BTC, MSBT, Total
+async function fetchFarside() {
+    console.log('Scraping Farside...');
+    const html = await httpGet('farside.co.uk', '/btc/');
 
-    // Step 1: Fetch aggregate totals
-    console.log('\n--- Fetching aggregate totals ---');
-    const aggRes = await postRequest({ type: 'us-btc-spot' });
-    console.log('Code:', aggRes.code, 'rows:', aggRes.data?.length ?? aggRes.data?.list?.length ?? 0);
+    const rows = [];
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let match;
 
-    let list = Array.isArray(aggRes.data) ? aggRes.data : (aggRes.data?.list || []);
-    console.log('List length:', list.length);
-
-    // Build a map of date -> total
-    const totalsMap = {};
-    list.forEach(item => {
-        if (item.date && isTradingDay(item.date)) {
-            totalsMap[item.date] = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
+    while ((match = rowRegex.exec(html)) !== null) {
+        const rowHtml = match[1];
+        const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+        const cells = [];
+        let cm;
+        while ((cm = cellRegex.exec(rowHtml)) !== null) {
+            cells.push(cm[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g,' ').trim());
         }
-    });
-    console.log('Trading day totals:', Object.keys(totalsMap).length, '| Latest:', Object.keys(totalsMap).sort().reverse()[0]);
 
-    // Step 2: Fetch per-ETF breakdown
-    console.log('\n--- Fetching per-ETF data ---');
-    const perEtf = {}; // { date: { IBIT: x, FBTC: y, ... } }
+        // Farside format: DD/MM/YYYY in first cell
+        if (cells.length >= 13 && /^\d{2}\/\d{2}\/\d{4}$/.test(cells[0])) {
+            const parts = cells[0].split('/');
+            const date = `${parts[2]}-${parts[1]}-${parts[0]}`;
+            if (!isTradingDay(date)) continue;
 
-    for (const [ticker, type] of ETF_TYPES) {
-        try {
-            const res = await postRequest({ type });
-            const etfList = Array.isArray(res.data) ? res.data : (res.data?.list || []);
-            let count = 0;
-            etfList.forEach(item => {
-                if (!item.date || !isTradingDay(item.date)) return;
-                if (!perEtf[item.date]) perEtf[item.date] = {};
-                perEtf[item.date][ticker] = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
-                count++;
-            });
-            console.log(ticker + ':', count, 'days | code:', res.code);
-        } catch(e) {
-            console.log(ticker + ': failed -', e.message);
+            const parseVal = s => {
+                s = s.replace(/,/g,'').trim();
+                if (!s || s === '-' || s === '' || s.toLowerCase() === 'n/a') return null;
+                const n = parseFloat(s);
+                return isNaN(n) ? null : n;
+            };
+
+            // Columns after date: IBIT, FBTC, GBTC, ARKB, BITB, BTCO, HODL, BRRR, EZBC, BTCW, BTC, MSBT, Total
+            const etfVals = cells.slice(1, 13).map(parseVal);
+            const total = parseVal(cells[13]) ?? etfVals.reduce((s, v) => s + (v || 0), 0);
+
+            if (total === null || total === 0) continue;
+
+            const row = { date };
+            ETFS.forEach((e, i) => { row[e] = etfVals[i] ?? null; });
+            row.total = parseFloat(total.toFixed(2));
+            rows.push(row);
         }
     }
 
-    // Step 3: Build final rows combining totals + per-ETF
-    const allDates = new Set([...Object.keys(totalsMap), ...Object.keys(perEtf)]);
-    const freshRows = [];
+    rows.sort((a, b) => b.date.localeCompare(a.date));
+    console.log(`Farside: ${rows.length} rows | Latest: ${rows[0]?.date}`);
+    if (rows.length > 0) console.log('Sample:', JSON.stringify(rows[0]).slice(0, 150));
+    return rows;
+}
 
-    allDates.forEach(date => {
-        if (!isTradingDay(date)) return;
-        const total = totalsMap[date];
-        if (total === undefined || total === 0) return;
+// ── SOSOVALUE TOTALS (fallback / gap-fill) ─────────────────────────────────
+async function fetchSoSoValue() {
+    if (!SOSO_KEY) throw new Error('No key');
+    console.log('Fetching SoSoValue totals...');
+    const res = await httpPost('api.sosovalue.xyz', '/openapi/v2/etf/historicalInflowChart',
+        { type: 'us-btc-spot' }, { 'x-soso-api-key': SOSO_KEY });
 
-        const row = { date };
-        ETFS.forEach(e => {
-            row[e] = perEtf[date]?.[e] ?? null;
-        });
-        row.total = total;
-        freshRows.push(row);
-    });
+    const list = Array.isArray(res.data) ? res.data : (res.data?.list || []);
+    console.log(`SoSoValue: ${list.length} rows | code: ${res.code}`);
 
-    freshRows.sort((a, b) => b.date.localeCompare(a.date));
-    console.log('\nFresh rows built:', freshRows.length, '| Latest:', freshRows[0]?.date);
+    return list
+        .filter(item => item.date && isTradingDay(item.date))
+        .map(item => {
+            const row = { date: item.date };
+            ETFS.forEach(e => { row[e] = null; });
+            row.total = parseFloat((item.totalNetInflow / 1e6).toFixed(2));
+            return row;
+        })
+        .filter(r => r.total !== 0)
+        .sort((a, b) => b.date.localeCompare(a.date));
+}
 
-    // Check per-ETF coverage
-    const hasPerEtf = freshRows.slice(0, 5).some(r => ETFS.some(e => r[e] !== null));
-    console.log('Per-ETF data available:', hasPerEtf);
-
-    // Step 4: Merge with existing file
+// ── MERGE & WRITE ──────────────────────────────────────────────────────────
+function mergeAndWrite(primaryRows, fallbackRows, source) {
+    // Start with existing file
     let existingRows = [];
     if (fs.existsSync('etf-flows.json')) {
         try {
             const existing = JSON.parse(fs.readFileSync('etf-flows.json', 'utf8'));
             existingRows = (existing.rows || []).filter(r => r.total !== 0 && isTradingDay(r.date));
-            console.log('Existing rows:', existingRows.length);
         } catch(e) {}
     }
 
     const merged = {};
     existingRows.forEach(r => { merged[r.date] = r; });
-    freshRows.forEach(r => { merged[r.date] = r; }); // fresh wins
+    fallbackRows.forEach(r => { merged[r.date] = r; });   // fallback fills gaps
+    primaryRows.forEach(r => { merged[r.date] = r; });    // primary wins
 
     const finalRows = Object.values(merged)
         .filter(r => r.total !== 0 && isTradingDay(r.date))
         .sort((a, b) => b.date.localeCompare(a.date));
 
-    fs.writeFileSync('etf-flows.json', JSON.stringify({
+    const hasPerEtf = finalRows.slice(0, 10).some(r => ETFS.some(e => r[e] !== null && r[e] !== 0));
+
+    const output = {
         generated: new Date().toISOString(),
-        source: 'SoSoValue API via GitHub Actions',
+        source,
         hasPerEtf,
         etfs: ETFS,
         count: finalRows.length,
         latest: finalRows[0]?.date,
-        oldest: finalRows[finalRows.length-1]?.date,
+        oldest: finalRows[finalRows.length - 1]?.date,
         rows: finalRows,
-    }, null, 2));
+    };
 
-    console.log('\nDone! Written', finalRows.length, 'rows | Latest:', finalRows[0]?.date);
+    fs.writeFileSync('etf-flows.json', JSON.stringify(output, null, 2));
+    console.log(`\nWritten: ${finalRows.length} rows | Latest: ${finalRows[0]?.date} | hasPerEtf: ${hasPerEtf}`);
+}
+
+// ── MAIN ───────────────────────────────────────────────────────────────────
+async function main() {
+    console.log(`[${new Date().toISOString()}] Starting ETF fetch...`);
+
+    let farsideRows = [];
+    let sosoRows = [];
+
+    // Try Farside first (has per-ETF breakdown)
+    try {
+        farsideRows = await fetchFarside();
+    } catch(e) {
+        console.warn('Farside failed:', e.message);
+    }
+
+    // Try SoSoValue for totals (fills any gaps Farside might have)
+    try {
+        sosoRows = await fetchSoSoValue();
+    } catch(e) {
+        console.warn('SoSoValue failed:', e.message);
+    }
+
+    if (farsideRows.length === 0 && sosoRows.length === 0) {
+        console.warn('All sources failed — keeping existing data');
+        return;
+    }
+
+    // Farside is primary (has per-ETF), SoSoValue fills gaps
+    const source = farsideRows.length > 0
+        ? 'Farside Investors (scraped daily)'
+        : 'SoSoValue API';
+
+    mergeAndWrite(farsideRows, sosoRows, source);
 }
 
 main().catch(err => {
