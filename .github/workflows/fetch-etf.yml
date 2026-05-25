@@ -2,8 +2,10 @@ name: Fetch ETF Flows
 
 on:
   schedule:
-    - cron: '0 9 * * 1-5'
-    - cron: '0 14 * * 1-5'
+    - cron: '0 5 * * 1-5'   # 09:00 UAE (UTC+4) — morning fetch
+    - cron: '0 10 * * 1-5'  # 14:00 UAE (UTC+4) — afternoon fetch
+    - cron: '0 15 * * 1-5'  # 19:00 UAE (UTC+4) — evening fetch (catches US market close data)
+    - cron: '0 19 * * 1-5'  # 23:00 UAE (UTC+4) — late night fetch (catches Farside/SoSoValue publish)
   workflow_dispatch:
 
 permissions:
