@@ -1,5 +1,5 @@
 {
-  "generated": "2026-06-22T21:33:19.472Z",
+  "generated": "2026-06-23T08:28:58.295Z",
   "source": "SoSoValue API",
   "hasPerEtf": false,
   "etfs": [
@@ -16,10 +16,26 @@
     "BTC",
     "MSBT"
   ],
-  "count": 328,
-  "latest": "2026-06-18",
+  "count": 329,
+  "latest": "2026-06-22",
   "oldest": "2024-01-11",
   "rows": [
+    {
+      "date": "2026-06-22",
+      "IBIT": null,
+      "FBTC": null,
+      "GBTC": null,
+      "ARKB": null,
+      "BITB": null,
+      "BTCO": null,
+      "HODL": null,
+      "BRRR": null,
+      "EZBC": null,
+      "BTCW": null,
+      "BTC": null,
+      "MSBT": null,
+      "total": -68.18
+    },
     {
       "date": "2026-06-18",
       "IBIT": null,
